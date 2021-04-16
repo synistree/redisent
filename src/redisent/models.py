@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import pickle
 
-from dataclasses import dataclass, field, fields, asdict
+from dataclasses import dataclass, field, fields, asdict, Field
 from tabulate import tabulate
 from typing import Mapping, Any, List, Optional, MutableMapping, cast
 
@@ -82,17 +82,17 @@ class RedisEntry:
         return dump_out
 
     @classmethod
-    def get_entry_fields(cls, include_redis_fields: bool = False, include_internal_fields: bool = False) -> List[str]:
+    def get_entry_fields(cls, include_redis_fields: bool = False, include_internal_fields: bool = False) -> Mapping[str, Field]:
         """
         Class method used for building a list of strings for each field name, based on the provided filering attributes
 
-        :param include_redis_fields:    if set, include fields with metadata indicating they are Redis-related fields (i.e.
-                                        ``redis_id`` or ``redis_name``)
+        :param include_redis_fields: if set, include fields with metadata indicating they are Redis-related fields (i.e.
+                                     ``redis_id`` or ``redis_name``)
         :param include_internal_fields: if set, include internal fields which are used by ``redisent`` only (any marked
                                         with metadata attribute ``internal_field``)
         """
 
-        flds = []
+        flds = {}
 
         for fld in fields(cls):
             is_redis_fld = fld.metadata.get('redis_field', False)
@@ -107,7 +107,7 @@ class RedisEntry:
             if not fld.init:
                 continue
 
-            flds.append(fld.name)
+            flds[fld.name] = fld
 
         return flds
 
@@ -120,7 +120,7 @@ class RedisEntry:
         will only return fields related to this specific entry's dataclass definition
         """
 
-        return self.get_entry_fields(include_redis_fields=False, include_internal_fields=False)
+        return list(self.get_entry_fields(include_redis_fields=False, include_internal_fields=False).keys())
 
     @property
     def is_hashmap(self) -> bool:
@@ -248,18 +248,32 @@ class RedisEntry:
         """
 
         entry_bytes = self.encode_entry(self)
-        op_name = f'set(key="{self.redis_id}")' if not self.redis_name else f'hset(key="{self.redis_id}", name="{self.redis_name}")'
-
-        with helper.wrapped_redis(op_name=op_name) as r_conn:
-            if not self.redis_name:
-                return True if r_conn.set(self.redis_id, entry_bytes) else False
-
-            return True if r_conn.hset(self.redis_id, self.redis_name, entry_bytes) else False
+        return helper.set(self.redis_id, entry_bytes, redis_name=self.redis_name)
 
     @classmethod
-    def fetch(cls, helper: RedisentHelper, redis_id: str, redis_name: str = None) -> RedisEntry:
+    def fetch_all(cls, helper: RedisentHelper, redis_id: str, check_exists: bool = True) -> Mapping[str, RedisEntry]:
         """
-        Blocking / synchronous method for fetching entries from Redis, using the provided :py:class:`redisent.helpers.RedisentHelper`
+        Method for fetching **all** entries for a given hashmap from Redis, using the provided :py:class:`redisent.helpers.RedisentHelper`
+        instance.
+
+        Under the hood, this method will call the :py:func:`redisent.helpers.RedisentHelper.keys` method to enumerate all of the hashmap entry keys and
+        iteratively fetch them and return a mapping of hash keys to ``RedisEntry`` instances.
+
+        :param helper: configured instance of :py:class:`redisent.helpers.RedisentHelper` to be used for fetching entries
+        :param redis_id: unique Redis ID for hash map entries
+        :param check_exists: if set, check first that there is an existing Redis entry to fetch. If not, a :py:exc:`RedisEntry` is raised
+        """
+
+        if check_exists and not helper.exists(redis_id):
+            raise RedisError(f'Failed to find entry for "{redis_id}" in Redis while fetching all instances')
+
+        ent_keys = helper.keys(redis_id=redis_id)
+        return {e_key: cls.fetch(helper, redis_id=redis_id, redis_name=e_key) for e_key in ent_keys}
+
+    @classmethod
+    def fetch(cls, helper: RedisentHelper, redis_id: str, redis_name: str = None, check_exists: bool = True) -> RedisEntry:
+        """
+        Method for fetching entries from Redis, using the provided :py:class:`redisent.helpers.RedisentHelper`
         instance.
 
         This method will do the actual decoding using the :py:func:`RedisEntry.decode_entry` method after fetching the ``bytes`` value
@@ -269,37 +283,27 @@ class RedisEntry:
         :param helper: configured instance of :py:class:`redisent.helpers.RedisentHelper` to be used for storing entry
         :param redis_id: unique Redis ID for entry
         :param redis_name: unique Redis hashmap name (if entity is stored as a hashmap, this is required)
+        :param check_exists: if set, check first that there is an existing Redis entry to fetch. If not, a :py:exc:`RedisEntry` is raised
         """
 
-        op_name = f'get(key="{redis_id}")' if not redis_name else f'hget(key="{redis_id}", name="{redis_name}")'
-        name_str = f' of entry "{redis_name}"' if redis_name else ''
+        red_ent = f'hash entry for "{redis_name}" in "{redis_id}"' if redis_name else f'entry "{redis_id}"'
 
-        with helper.wrapped_redis(op_name=op_name) as r_conn:
-            entry_bytes = r_conn.get(redis_id) if not redis_name else r_conn.hget(redis_id, redis_name)
+        if check_exists and not helper.exists(redis_id, redis_name=redis_name):
+            raise RedisError(f'Failed to find {red_ent} was not found in Redis')
+
+        entry_bytes = helper.get(redis_id, redis_name=redis_name)
 
         if not entry_bytes:
-            raise RedisError(f'Failure during fetch of key "{redis_id}"{name_str}: No data returned')
+            raise RedisError(f'Failure during fetch of {red_ent}: No data returned')
 
         return cast(RedisEntry, cls.decode_entry(entry_bytes))
 
-    def delete(self, helper: RedisentHelper, check_exists: bool = True) -> bool:
+    def delete(self, helper: RedisentHelper, check_exists: bool = True) -> Optional[bool]:
         """
-        Synchronous method responsible for actually deleting a RedisEntry from Redis
+        Method responsible for actually deleting a RedisEntry from Redis
 
         :param helper: configured instance of :py:class:`redisent.helpers.RedisentHelper` to be used to delete the entry
         :param check_exists: if set, check first that there is an existing Redis entry for this instance
         """
 
-        if check_exists:
-            if not helper.exists(self.redis_id, redis_name=self.redis_name):
-                redis_key = '"{self.redis_id}"'
-                if self.redis_name:
-                    redis_key = f'{redis_key} (redis_name: "{self.redis_name}")'
-
-                logger.warning(f'Request to delete entry {redis_key} failed: No such entry in Redis')
-                return False
-
-        op_name = f'hdel("{self.redis_id}", "{self.redis_name}")' if self.redis_name else f'delete("{self.redis_id}")'
-        with helper.wrapped_redis(op_name) as r_conn:
-            res = r_conn.hdel(self.redis_id, self.redis_name) if self.redis_name else r_conn.delete(self.redis_id)
-            return True if res else False
+        return helper.delete(self.redis_id, redis_name=self.redis_name, check_exists=check_exists)
