@@ -1,4 +1,5 @@
 # Testing
+build
 pytest
 pytest-mock
 pytest-cov
